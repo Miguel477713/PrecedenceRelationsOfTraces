@@ -377,23 +377,240 @@ def DrawDirectedEventGraph(
 # NFA: Trie construction (safe, no unhashable states)
 # ============================================================
 
+# python
+def CompleteAutomatonWithPrecedenceLoops(
+    initialStateId: str,
+    statesById: Dict[str, AutomatonState],
+    precedenceFacts: Sequence[PrecedenceFact]
+) -> None:
+    """
+    Systematically completes the automaton by analyzing precedence relations
+    and adding necessary transitions to ensure all required loops are present.
+    This is a general solution that works for any detected loop patterns.
+    """
+    # Build event precedence graph from precedence facts
+    eventPrecedence: Dict[str, Set[str]] = {}
+    for fact in precedenceFacts:
+        if fact.earlierEvent == StartSentinelEvent or fact.laterEvent == EndSentinelEvent:
+            continue
+        eventPrecedence.setdefault(fact.earlierEvent, set()).add(fact.laterEvent)
+    
+    # Build state-event reachability map
+    stateEventReachability: Dict[str, Set[str]] = {}
+    for stateId, state in statesById.items():
+        reachableEvents = set()
+        for event in state.transitionsByEvent:
+            reachableEvents.add(event)
+        stateEventReachability[stateId] = reachableEvents
+    
+    # Detect missing bidirectional transitions (loops)
+    transitionsAdded = 0
+    
+    # For each state, check if it should have loop transitions
+    for sourceStateId, sourceState in statesById.items():
+        for event in sourceState.transitionsByEvent:
+            targetStates = sourceState.transitionsByEvent[event]
+            
+            for targetStateId in targetStates:
+                # Check if there should be a reverse transition
+                # Based on precedence relations, if A precedes B and B precedes A in different contexts,
+                # there should be a loop
+                shouldHaveReverse = False
+                
+                # Check if the target state can reach back to source with the same event
+                if targetStateId in statesById:
+                    targetState = statesById[targetStateId]
+                    currentReverseTargets = targetState.transitionsByEvent.get(event, set())
+                    
+                    if sourceStateId not in currentReverseTargets:
+                        # Determine if reverse transition should exist based on precedence analysis
+                        shouldHaveReverse = ShouldHaveReverseTransition(
+                            sourceStateId, targetStateId, event, 
+                            statesById, eventPrecedence, precedenceFacts
+                        )
+                        
+                        if shouldHaveReverse:
+                            targetState.AddTransition(event, sourceStateId)
+                            transitionsAdded += 1
+                            print(f"Added loop transition: {targetStateId} --{event}--> {sourceStateId}")
+    
+    # Also check for missing transitions based on event precedence closure
+    transitionsAdded += AddMissingPrecedenceTransitions(
+        initialStateId, statesById, eventPrecedence, precedenceFacts
+    )
+
+    # NEW: ensure self-loops for events that appear consecutively in traces (e.g., (A,A,TRx))
+    selfLoopEvents: Set[str] = set()
+    for fact in precedenceFacts:
+        if fact.earlierEvent == fact.laterEvent and fact.earlierEvent != StartSentinelEvent and fact.laterEvent != EndSentinelEvent:
+            selfLoopEvents.add(fact.earlierEvent)
+
+    for stateId, state in statesById.items():
+        for event in list(state.transitionsByEvent.keys()):
+            if event in selfLoopEvents:
+                if stateId not in state.transitionsByEvent.get(event, set()):
+                    state.AddTransition(event, stateId)
+                    transitionsAdded += 1
+                    print(f"Added self-loop: {stateId} --{event}--> {stateId}")
+
+    if transitionsAdded > 0:
+        print(f"Completed automaton with {transitionsAdded} necessary transitions")
+    else:
+        print("Automaton is already complete with respect to precedence relations")
+
+
+def ShouldHaveReverseTransition(
+    sourceStateId: str,
+    targetStateId: str,
+    event: str,
+    statesById: Dict[str, AutomatonState],
+    eventPrecedence: Dict[str, Set[str]],
+    precedenceFacts: Sequence[PrecedenceFact]
+) -> bool:
+    """
+    Determines if a reverse transition should exist based on formal criteria.
+    """
+    # Check if there are precedence facts that suggest bidirectional relationship
+    sourceEvents = set()
+    targetEvents = set()
+    
+    # Collect all events that can be reached from each state
+    if sourceStateId in statesById:
+        for evt in statesById[sourceStateId].transitionsByEvent:
+            sourceEvents.add(evt)
+    
+    if targetStateId in statesById:
+        for evt in statesById[targetStateId].transitionsByEvent:
+            targetEvents.add(evt)
+    
+    # Check if the event appears in precedence relations that suggest a loop
+    # Look for cases where the same event appears in different precedence contexts
+    eventInPrecedence = False
+    reverseEventInPrecedence = False
+    
+    for fact in precedenceFacts:
+        if fact.earlierEvent == event or fact.laterEvent == event:
+            eventInPrecedence = True
+        if fact.earlierEvent == event and fact.laterEvent in sourceEvents:
+            reverseEventInPrecedence = True
+        if fact.earlierEvent in targetEvents and fact.laterEvent == event:
+            reverseEventInPrecedence = True
+    
+    # If the event participates in precedence relations and there's evidence
+    # of bidirectional behavior, add the reverse transition
+    return eventInPrecedence and reverseEventInPrecedence
+
+
+def AddMissingPrecedenceTransitions(
+    initialStateId: str,
+    statesById: Dict[str, AutomatonState],
+    eventPrecedence: Dict[str, Set[str]],
+    precedenceFacts: Sequence[PrecedenceFact]
+) -> int:
+    """
+    Adds missing transitions based on precedence closure analysis.
+    """
+    transitionsAdded = 0
+    
+    # Build a map of which events should be available at each state
+    # based on the precedence relations observed in traces
+    stateRequiredEvents: Dict[str, Set[str]] = {}
+    
+    # Analyze precedence facts to determine required events at each state
+    for fact in precedenceFacts:
+        if fact.earlierEvent == StartSentinelEvent or fact.laterEvent == EndSentinelEvent:
+            continue
+        
+        # Find states that should have transitions for these events
+        for stateId, state in statesById.items():
+            if stateId == initialStateId:
+                continue  # Skip initial state as it's handled separately
+            
+            # Check if this state should have the laterEvent based on precedence
+            if fact.earlierEvent in state.transitionsByEvent:
+                stateRequiredEvents.setdefault(stateId, set()).add(fact.laterEvent)
+    
+    # Add missing required transitions
+    for stateId, requiredEvents in stateRequiredEvents.items():
+        if stateId in statesById:
+            state = statesById[stateId]
+            for event in requiredEvents:
+                if event not in state.transitionsByEvent:
+                    # Find appropriate target state for this transition
+                    targetState = FindTargetStateForEvent(event, statesById)
+                    if targetState:
+                        state.AddTransition(event, targetState)
+                        transitionsAdded += 1
+                        print(f"Added precedence-based transition: {stateId} --{event}--> {targetState}")
+    
+    return transitionsAdded
+
+
+def FindTargetStateForEvent(event: str, statesById: Dict[str, AutomatonState]) -> Optional[str]:
+    """
+    Finds an appropriate target state for a given event based on existing patterns.
+    """
+    # Look for existing states that have this event as incoming
+    for stateId, state in statesById.items():
+        for evt, targets in state.transitionsByEvent.items():
+            if evt == event and targets:
+                return sorted(targets)[0]  # Return first existing target
+    
+    # If no existing pattern found, create a new state
+    maxStateNum = 0
+    for stateId in statesById.keys():
+        if stateId.startswith('q'):
+            try:
+                num = int(stateId[1:])
+                maxStateNum = max(maxStateNum, num)
+            except ValueError:
+                continue
+    
+    newStateId = f"q{maxStateNum + 1}"
+    statesById[newStateId] = AutomatonState(newStateId)
+    return newStateId
+
+
 def BuildTrieNfa(traces: Sequence[Trace]) -> Tuple[str, Dict[str, AutomatonState]]:
     """
     Returns:
       initialStateId,
       statesById dictionary
+
+    Builds a trie NFA whose traces share prefixes.
+    Changes:
+    - Use a single shared accepting end state ("q_end").
+    - Route every trace's last-event transition to that shared end state.
+    - Do NOT create separate terminal states per trace.
+    - Reuse existing target states for transitions (including from the initial state)
+      so loops and merges are represented instead of artificially duplicating states.
     """
     initialStateId = "q0"
     statesById: Dict[str, AutomatonState] = {initialStateId: AutomatonState(initialStateId)}
     nextStateIndex = 1
 
+    # single shared accepting end state
+    finalStateId = "q_end"
+    statesById[finalStateId] = AutomatonState(finalStateId)
+    statesById[finalStateId].isAccepting = True
+
     for trace in traces:
         currentStateId = initialStateId
+        events = trace.eventsInOrder
 
-        for event in trace.eventsInOrder:
+        for index, event in enumerate(events):
             currentState = statesById[currentStateId]
-            existingTargetStateIds = currentState.transitionsByEvent.get(event, set())
 
+            # If this is the last event of the trace, route it to the shared final state.
+            if index == len(events) - 1:
+                currentState.AddTransition(event, finalStateId)
+                currentStateId = finalStateId
+                # do not create a new per-trace terminal state
+                continue
+
+            # Unified behavior: reuse an existing target for the event if present,
+            # otherwise create a new state (applies to initial state as well).
+            existingTargetStateIds = currentState.transitionsByEvent.get(event, set())
             if existingTargetStateIds:
                 nextStateId = sorted(existingTargetStateIds)[0]
             else:
@@ -404,9 +621,101 @@ def BuildTrieNfa(traces: Sequence[Trace]) -> Tuple[str, Dict[str, AutomatonState
 
             currentStateId = nextStateId
 
-        statesById[currentStateId].isAccepting = True
+        # no per-trace accepting flag here; the shared final state is accepting
 
     return (initialStateId, statesById)
+
+
+
+def _GetReachablePostOrder(initialStateId: str, statesById: Dict[str, AutomatonState]) -> List[str]:
+    """
+    Returns reachable state IDs in post-order (children before parents).
+    Assumes the NFA graph is acyclic (true for the trie-based construction).
+    """
+    visited: Set[str] = set()
+    postOrder: List[str] = []
+    stack: List[Tuple[str, bool]] = [(initialStateId, False)]
+
+    while stack:
+        stateId, expanded = stack.pop()
+        if stateId not in statesById:
+            continue
+
+        if expanded:
+            postOrder.append(stateId)
+            continue
+
+        if stateId in visited:
+            continue
+
+        visited.add(stateId)
+        stack.append((stateId, True))
+
+        state = statesById[stateId]
+        # push children
+        for event in sorted(state.transitionsByEvent.keys(), reverse=True):
+            for targetStateId in sorted(state.transitionsByEvent[event], reverse=True):
+                if targetStateId in statesById and targetStateId not in visited:
+                    stack.append((targetStateId, False))
+
+    return postOrder
+
+
+def BuildCompactedNfaBySuffixMerging(
+    initialStateId: str,
+    statesById: Dict[str, AutomatonState],
+) -> Tuple[str, Dict[str, AutomatonState]]:
+    """
+    Builds a more compact NFA by merging states with identical "suffix" behavior:
+      - same accepting flag
+      - same outgoing transitions by event, considering already-merged targets
+
+    This corresponds to grouping common suffixes in the set of traces (as described in the project statement).
+    IMPORTANT: This only works safely on the acyclic trie NFA (no added loop-completion).
+    """
+    postOrder = _GetReachablePostOrder(initialStateId, statesById)
+
+    # map old state -> representative (kept) state id
+    representativeByStateId: Dict[str, str] = {}
+    representativeBySignature: Dict[Tuple[bool, Tuple[Tuple[str, Tuple[str, ...]], ...]], str] = {}
+
+    for stateId in postOrder:
+        state = statesById[stateId]
+
+        signatureTransitions: List[Tuple[str, Tuple[str, ...]]] = []
+        for event in sorted(state.transitionsByEvent.keys()):
+            mappedTargets = sorted({representativeByStateId.get(t, t) for t in state.transitionsByEvent[event]})
+            signatureTransitions.append((event, tuple(mappedTargets)))
+
+        signature = (state.isAccepting, tuple(signatureTransitions))
+
+        existingRep = representativeBySignature.get(signature)
+        if existingRep is None:
+            representativeBySignature[signature] = stateId
+            representativeByStateId[stateId] = stateId
+        else:
+            representativeByStateId[stateId] = existingRep
+
+    # rebuild canonical states with transitions pointing to representatives
+    compactedStatesById: Dict[str, AutomatonState] = {}
+
+    for repStateId in sorted(set(representativeByStateId.values())):
+        newState = AutomatonState(repStateId)
+        newState.isAccepting = statesById[repStateId].isAccepting
+        compactedStatesById[repStateId] = newState
+
+    for oldStateId in postOrder:
+        repStateId = representativeByStateId[oldStateId]
+        oldState = statesById[oldStateId]
+        repState = compactedStatesById[repStateId]
+
+        for event in oldState.transitionsByEvent:
+            for targetOld in oldState.transitionsByEvent[event]:
+                targetRep = representativeByStateId.get(targetOld, targetOld)
+                repState.AddTransition(event, targetRep)
+
+    compactedInitialStateId = representativeByStateId.get(initialStateId, initialStateId)
+    return (compactedInitialStateId, compactedStatesById)
 
 
 def ListAllReachableStateIds(initialStateId: str, statesById: Dict[str, AutomatonState]) -> List[str]:
@@ -458,14 +767,23 @@ def DrawNfaWithGraphviz(
     dot.render(outputFilePrefix, cleanup=True)
 
 def WritePrecedenceFactsToTextFile(precedenceFacts: Sequence[PrecedenceFact], outputPath: str) -> None:
+    """
+    Writes precedence facts to a text file, preserving the first-seen order
+    but omitting duplicate (earlierEvent, laterEvent, traceName) tuples.
+    """
+    seen: Set[Tuple[str, str, str]] = set()
     with open(outputPath, "w", encoding="utf-8") as outputFile:
         for fact in precedenceFacts:
+            key = fact.AsTuple()
+            if key in seen:
+                continue
+            seen.add(key)
             outputFile.write(f"({fact.earlierEvent}, {fact.laterEvent}, {fact.traceName})\n")
 
 def Main() -> None:
     print("Proyecto: Procesamiento de secuencias de eventos (Graphviz)")
 
-    inputPath = input("Enter input trace file path (e.g.: traces.txt): ").strip()
+    inputPath = input("Enter input trace file path (e.g.: traces2.txt): ").strip()
     if not inputPath:
         print("Error: input path is required.")
         return
@@ -546,7 +864,19 @@ def Main() -> None:
     )
     print(f"\nRendered trie NFA to: {trieNfaOutputPrefix}.png")
 
-    print("Note: Compact NFA merging is not included in this fixed version (ID-based transitions).")
+
+    # Build a more compact NFA by grouping common prefixes (trie) AND common suffixes (merging equivalent subgraphs).
+    compactedInitialStateId, compactedStatesById = BuildCompactedNfaBySuffixMerging(
+        trieNfaInitialStateId, trieNfaStatesById
+    )
+    compactedNfaOutputPrefix = f"{outputPrefix}_NfaCompacted"
+    DrawNfaWithGraphviz(
+        initialStateId=compactedInitialStateId,
+        statesById=compactedStatesById,
+        outputFilePrefix=compactedNfaOutputPrefix,
+        graphTitle="NfaCompacted",
+    )
+    print(f"Rendered compacted NFA to: {compactedNfaOutputPrefix}.png")
 
     print("\nDone.")
 
