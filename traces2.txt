@@ -1,0 +1,5 @@
+NTR: 4
+TR1: I P N P N F
+TR2: I G R O F
+TR3: I O P F
+TR4: I R G F
